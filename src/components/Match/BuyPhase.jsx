@@ -1,52 +1,36 @@
-import { useMatchStore } from '../../store/matchStore';
-import { useEconomyStore } from '../../store/economyStore';
-import { usePhaseTimer } from '../../hooks/usePhaseTimer';
-import { MATERIAL_TYPES, MATERIAL_PROPERTIES } from '../../constants/materials';
+import { useEffect } from 'react';
+import { emitInventory } from './ActionPhase';
 
-export default function BuyPhase() {
-  const phaseEndsAtMs = useMatchStore((s) => s.phaseEndsAtMs);
-  const remainingSec = usePhaseTimer(phaseEndsAtMs);
-  const { credits, cart, addToCart, removeFromCart } = useEconomyStore();
+const PRICE = {
+  titanium: 400,
+  glass: 250,
+  rubber: 200,
+};
 
-  return (
-    <div className="buy-phase">
-      <header>
-        <h2>Buy Phase</h2>
-        <span className="timer">{remainingSec}s</span>
-        <span className="credits">{credits} cr</span>
-      </header>
+const SELLABLE = new Set(['titanium', 'glass', 'rubber']);
 
-      <section className="skin-shop">
-        {Object.values(MATERIAL_TYPES).map((type) => {
-          const props = MATERIAL_PROPERTIES[type];
-          if (props.creditCost === 0) return null; // skip CONCRETE (default, not purchasable)
-          return (
-            <button
-              key={type}
-              disabled={credits < props.creditCost}
-              onClick={() => addToCart(type, props.creditCost)}
-            >
-              {props.label} — {props.creditCost} cr
-            </button>
-          );
-        })}
-      </section>
+export function tryBuy(game, material) {
+  if (!game || game.dead || game.phase !== 'buy') return;
+  const name = String(material || '').toLowerCase();
+  if (!SELLABLE.has(name) || name === game.bannedMaterial) return;
+  const cost = PRICE[name];
+  if (!cost || game.credits < cost) return;
+  game.credits -= cost;
+  game.inventory.push(name);
+  game.slotIndex = game.inventory.length - 1;
+  game.emit('game:credits', { credits: game.credits });
+  emitInventory(game);
+}
 
-      <section className="cart">
-        <h3>Cart</h3>
-        <ul>
-          {cart.map((item, i) => (
-            <li key={i}>
-              {item.materialType} ({item.cost} cr)
-              <button onClick={() => removeFromCart(i)}>Remove</button>
-            </li>
-          ))}
-        </ul>
-      </section>
+export default function BuyPhase({ gameRef }) {
+  useEffect(() => {
+    const onBuy = (event) => {
+      const material = event.detail?.material ?? event.detail;
+      tryBuy(gameRef.current, material);
+    };
+    window.addEventListener('hud:buy', onBuy);
+    return () => window.removeEventListener('hud:buy', onBuy);
+  }, [gameRef]);
 
-      {/* TODO: traditional weapons/armor shop panel alongside skin cartridges */}
-      {/* TODO: on phase end, commit cart to server via a Cloud Function call
-          rather than trusting the client-held credits balance */}
-    </div>
-  );
+  return null;
 }

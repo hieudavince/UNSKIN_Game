@@ -1,36 +1,65 @@
-import { useEffect, useState } from 'react';
-import { getMatchSummary } from '../../firebase/matchService';
+export function roundOutcome(game, cause) {
+  const playerSide = game.faction === 'outliers' ? 'Outliers' : 'Atlas';
+  const enemySide = game.faction === 'outliers' ? 'Atlas' : 'Outliers';
 
-// The "3D Wireframe Replay Theater" from the design doc — showing the
-// structural timeline of skin changes. This component fetches the archived
-// round data; actually scrubbing through a 3D replay is a game-engine
-// feature (see game/README.md), this renders the supporting timeline/stats UI.
-export default function PostRoundAnalysis({ matchId, roundNumber }) {
-  const [round, setRound] = useState(null);
+  if (cause === 'uplink') {
+    return {
+      playerWon: game.faction !== 'outliers',
+      reason: 'Uplink held',
+      killText: 'Atlas held the uplink',
+    };
+  }
+  if (cause === 'wipe') {
+    return {
+      playerWon: true,
+      reason: 'All enemies down',
+      killText: `${playerSide} won the round`,
+    };
+  }
+  if (cause === 'death') {
+    return {
+      playerWon: false,
+      reason: 'You were eliminated',
+      killText: `${enemySide} won the round`,
+    };
+  }
+  const playerWon = game.faction === 'outliers';
+  return {
+    playerWon,
+    reason: playerWon ? 'Defense held' : 'Attack failed',
+    killText: 'Outliers won the round',
+  };
+}
 
-  useEffect(() => {
-    getMatchSummary(matchId).then((match) => {
-      setRound(match?.rounds?.[roundNumber] ?? null);
-    });
-  }, [matchId, roundNumber]);
-
-  if (!round) return <div>Loading replay data…</div>;
-
+export default function PostRoundAnalysis({ playerWon, reason }) {
   return (
-    <div className="post-round-analysis">
-      <h2>Round {roundNumber} — {round.winner} won ({round.winCondition})</h2>
-      <h3>Skin Synergy Timeline</h3>
-      <ul>
-        {round.skinEvents.map((e, i) => (
-          <li key={i}>
-            [{Math.round(e.timestampMs / 1000)}s] {e.playerId} {e.action} {e.targetObjectId}
-            {' '}({e.materialBefore} → {e.materialAfter})
-            {e.ledToKill && ' — led to a kill'}
-            {e.ledToObjectiveDelay && ' — delayed objective'}
-          </li>
-        ))}
-      </ul>
-      {/* TODO: button to launch 3D Wireframe Replay Theater (engine layer) */}
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        pointerEvents: 'none',
+        zIndex: 2,
+      }}
+    >
+      <div style={{ textAlign: 'center', textShadow: '0 2px 18px rgba(0,0,0,0.85)' }}>
+        <div
+          style={{
+            margin: 0,
+            fontSize: 64,
+            fontWeight: 700,
+            letterSpacing: '0.14em',
+            color: playerWon ? '#e7ff8a' : '#ff8d7a',
+          }}
+        >
+          {playerWon ? 'VICTORY' : 'DEFEAT'}
+        </div>
+        <div style={{ marginTop: 8, fontSize: 18, letterSpacing: '0.04em', color: '#f4f4f4' }}>
+          {reason}
+        </div>
+      </div>
     </div>
   );
 }
