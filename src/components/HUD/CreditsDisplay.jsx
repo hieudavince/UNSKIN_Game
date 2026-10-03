@@ -1,6 +1,10 @@
-import { useEconomyStore } from '../../store/economyStore';
+export default function CreditDisplay() {
+  const credits = 4200;
 
-export default function CreditsDisplay() {
-  const credits = useEconomyStore((s) => s.credits);
-  return <div className="credits-display">{credits} cr</div>;
+  return (
+    <div className="credit-display">
+      <span>Credits</span>
+      <strong>{credits}</strong>
+    </div>
+  );
 }
