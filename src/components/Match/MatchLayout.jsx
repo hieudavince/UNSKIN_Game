@@ -14,6 +14,7 @@ import ActionPhase, {
   updateHighlight,
   updatePaint,
   useUtility,
+  pointInPoly,
 } from './ActionPhase';
 import BuyPhase from './BuyPhase';
 import PostRoundAnalysis, { roundOutcome } from './PostRoundAnalysis';
@@ -22,13 +23,17 @@ import { createViewmodel, showWeapon, syncEmitter, updateViewmodel } from './Vie
 
 const PHASE_MS = { buy: 15000, action: 120000, result: 5000 };
 const SPEED = 6;
+const WALK_SPEED = 2.45;
+const CROUCH_SPEED = 2.9;
 const GROUND_ACCEL = 70;
 const AIR_ACCEL = 35;
 const GRAVITY = 22;
 const JUMP = 7.2;
 const EYE = 1.6;
+const CROUCH_EYE = 0.78;
 const PLAYER_RADIUS = 0.34;
 const PLAYER_HEIGHT = 1.7;
+const CROUCH_HEIGHT = 1.02;
 const PITCH_LIMIT = 89 * Math.PI / 180;
 
 const DEFAULT_CONFIG = {
@@ -185,12 +190,12 @@ function approach(current, target, maxDelta) {
   return current + Math.sign(delta) * maxDelta;
 }
 
-function playerBox(x, feetY, z) {
+function playerBox(x, feetY, z, height = PLAYER_HEIGHT) {
   return {
     minX: x - PLAYER_RADIUS,
     maxX: x + PLAYER_RADIUS,
     minY: feetY,
-    maxY: feetY + PLAYER_HEIGHT,
+    maxY: feetY + height,
     minZ: z - PLAYER_RADIUS,
     maxZ: z + PLAYER_RADIUS,
   };
@@ -202,6 +207,14 @@ function supportHeight(game, x, z, feetY) {
   const tops = [];
   const sample = (mesh) => {
     if (mesh.userData.kind !== 'floor' || mesh.userData.solid === false) return;
+    if ((mesh.userData.axis || 'y') === 'y' && mesh.userData.openings && mesh.userData.openings.length) {
+      const sample = { u: x, v: z };
+      const open = mesh.userData.openings.some((poly) => pointInPoly(sample, poly));
+      const covered = (mesh.userData.stamps || []).some((stamp) => (
+        stamp && !stamp.userData.destroyed && stamp.userData.region && pointInPoly(sample, stamp.userData.region.points)
+      ));
+      if (open && !covered) return;
+    }
     const bounds = meshBox(mesh);
     if (bounds.maxY > limit) return;
     if (x + radius <= bounds.minX || x - radius >= bounds.maxX) return;
@@ -218,7 +231,8 @@ function supportHeight(game, x, z, feetY) {
 }
 
 function bodyInWall(game, x, feetY, z) {
-  const box = playerBox(x, feetY, z);
+  const height = game.player.bodyHeight || PLAYER_HEIGHT;
+  const box = playerBox(x, feetY, z, height);
   for (const mesh of game.moveMask) {
     if (!blocksMove(mesh, feetY)) continue;
     const bounds = meshBox(mesh);
@@ -232,7 +246,8 @@ function bodyInWall(game, x, feetY, z) {
 
 function clampCeiling(game, player) {
   const radius = 0.22;
-  let head = player.feetY + PLAYER_HEIGHT;
+  const height = player.bodyHeight || PLAYER_HEIGHT;
+  let head = player.feetY + height;
   for (const mesh of game.floors) {
     if (mesh.userData.solid === false) continue;
     const bounds = meshBox(mesh);
@@ -240,9 +255,9 @@ function clampCeiling(game, player) {
     if (player.z + radius <= bounds.minZ || player.z - radius >= bounds.maxZ) continue;
     if (player.feetY >= bounds.minY - 0.02) continue;
     if (head > bounds.minY) {
-      player.feetY = bounds.minY - PLAYER_HEIGHT - 0.02;
+      player.feetY = bounds.minY - height - 0.02;
       if (player.vy > 0) player.vy = 0;
-      head = player.feetY + PLAYER_HEIGHT;
+      head = player.feetY + height;
     }
   }
 }
@@ -259,19 +274,20 @@ function rubberBoost(game) {
   return 1;
 }
 
-function blocksMove(mesh, feetY) {
+function blocksMove(mesh, feetY, height = PLAYER_HEIGHT) {
   if (mesh.userData.solid === false || mesh.userData.kind === 'floor') return false;
   const bounds = meshBox(mesh);
   if (bounds.maxY <= feetY + 0.4) return false;
-  if (bounds.minY >= feetY + PLAYER_HEIGHT) return false;
+  if (bounds.minY >= feetY + height) return false;
   return true;
 }
 
 function resolveAxis(game, x, feetY, z, axis) {
-  const box = playerBox(x, feetY, z);
+  const height = game.player.bodyHeight || PLAYER_HEIGHT;
+  const box = playerBox(x, feetY, z, height);
   for (let pass = 0; pass < 3; pass += 1) {
     for (const mesh of game.moveMask) {
-      if (!blocksMove(mesh, feetY)) continue;
+      if (!blocksMove(mesh, feetY, height)) continue;
       const bounds = meshBox(mesh);
       if (box.minX >= bounds.maxX || box.maxX <= bounds.minX) continue;
       if (box.minY >= bounds.maxY || box.maxY <= bounds.minY) continue;
@@ -298,6 +314,9 @@ function resolveAxis(game, x, feetY, z, axis) {
 
 function wishVelocity(game, allowMove) {
   const keys = game.input.keys;
+  let speed = SPEED;
+  if (keys.ShiftLeft || keys.ShiftRight) speed = WALK_SPEED;
+  if ((game.player.crouch || 0) > 0.45) speed = Math.min(speed, CROUCH_SPEED);
   let forward = 0;
   let strafe = 0;
   if (allowMove) {
@@ -322,8 +341,8 @@ function wishVelocity(game, allowMove) {
   game._right.crossVectors(facing, game._up);
   if (game._right.lengthSq() > 0) game._right.normalize();
   return {
-    x: (facing.x * forward + game._right.x * strafe) * SPEED,
-    z: (facing.z * forward + game._right.z * strafe) * SPEED,
+    x: (facing.x * forward + game._right.x * strafe) * speed,
+    z: (facing.z * forward + game._right.z * strafe) * speed,
   };
 }
 
@@ -340,15 +359,45 @@ function placePlayer(game) {
   player.vz = 0;
   player.onGround = true;
   player.jumpLatch = false;
+  player.crouch = 0;
+  player.bodyHeight = PLAYER_HEIGHT;
+}
+
+function hasHeadroom(game, player, height) {
+  const head = player.feetY + height;
+  const radius = 0.22;
+  for (const mesh of game.floors) {
+    if (mesh.userData.solid === false) continue;
+    const bounds = meshBox(mesh);
+    if (player.x + radius <= bounds.minX || player.x - radius >= bounds.maxX) continue;
+    if (player.z + radius <= bounds.minZ || player.z - radius >= bounds.maxZ) continue;
+    if (player.feetY >= bounds.minY - 0.02) continue;
+    if (head > bounds.minY - 0.04) return false;
+  }
+  return true;
+}
+
+function updateStance(game, dt, allowMove) {
+  const player = game.player;
+  let want = allowMove && game.input.keys.KeyC ? 1 : 0;
+  if (want < 1 && (player.crouch || 0) > 0.15 && !hasHeadroom(game, player, PLAYER_HEIGHT)) want = 1;
+  player.crouch = approach(player.crouch || 0, want, dt * 7);
+  player.bodyHeight = PLAYER_HEIGHT + (CROUCH_HEIGHT - PLAYER_HEIGHT) * player.crouch;
 }
 
 function updatePlayer(game, dt, allowMove) {
   const player = game.player;
   releaseKeys(game);
+  updateStance(game, dt, allowMove);
   const wish = wishVelocity(game, allowMove);
   const accel = player.onGround ? GROUND_ACCEL : AIR_ACCEL;
-  player.vx = approach(player.vx, allowMove ? wish.x : 0, accel * dt);
-  player.vz = approach(player.vz, allowMove ? wish.z : 0, accel * dt);
+  if (player.onGround && wish.x === 0 && wish.z === 0) {
+    player.vx = 0;
+    player.vz = 0;
+  } else {
+    player.vx = approach(player.vx, allowMove ? wish.x : 0, accel * dt);
+    player.vz = approach(player.vz, allowMove ? wish.z : 0, accel * dt);
+  }
 
   if (allowMove && game.input.keys.Space && player.onGround && !player.jumpLatch) {
     player.vy = JUMP * rubberBoost(game);
@@ -383,23 +432,31 @@ function updatePlayer(game, dt, allowMove) {
 
 function releaseKeys(game) {
   const pending = game.input.releaseAt;
-  if (!pending) return;
   const now = performance.now();
-  for (const code of Object.keys(pending)) {
-    if (pending[code] && now >= pending[code]) {
-      game.input.keys[code] = false;
-      pending[code] = 0;
+  if (pending) {
+    for (const code of Object.keys(pending)) {
+      if (pending[code] && now >= pending[code]) {
+        game.input.keys[code] = false;
+        pending[code] = 0;
+      }
     }
+  }
+  const last = game.input.lastDown;
+  if (!last) return;
+  for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
+    if (!game.input.keys[code]) continue;
+    if (now - (last[code] || 0) > 1100) game.input.keys[code] = false;
   }
 }
 
 function separatePlayer(game) {
   const player = game.player;
+  const height = player.bodyHeight || PLAYER_HEIGHT;
   for (let pass = 0; pass < 4; pass += 1) {
-    const box = playerBox(player.x, player.feetY, player.z);
+    const box = playerBox(player.x, player.feetY, player.z, height);
     let best = null;
     for (const mesh of game.moveMask) {
-      if (!blocksMove(mesh, player.feetY)) continue;
+      if (!blocksMove(mesh, player.feetY, height)) continue;
       const bounds = meshBox(mesh);
       const xPen = Math.min(box.maxX, bounds.maxX) - Math.max(box.minX, bounds.minX);
       const yPen = Math.min(box.maxY, bounds.maxY) - Math.max(box.minY, bounds.minY);
@@ -432,7 +489,8 @@ function applyLook(game) {
 
 function applyCameraPosition(game) {
   const { camera, player } = game;
-  camera.position.set(player.x, player.feetY + EYE, player.z);
+  const eye = EYE + (CROUCH_EYE - EYE) * (player.crouch || 0);
+  camera.position.set(player.x, player.feetY + eye, player.z);
   camera.updateMatrixWorld();
 }
 
@@ -456,14 +514,14 @@ const PORTAL_UI = {
   iron: '#d7dee6',
 };
 
-function Crosshair({ weapon, material, stock, chips, hold }) {
+function Crosshair({ weapon, material, stock, chips, bombMode }) {
   const color = weapon === 'portal' ? (PORTAL_UI[material] || '#fff') : 'rgba(244,247,251,0.94)';
-  const label = hold != null
-    ? `HOLD  ${hold}`
-    : weapon === 'portal'
-      ? `${(material || 'glass').toUpperCase()}  ${stock?.[material] ?? 0} m²`
-      : weapon === 'hack'
-        ? `CHIP  ×${chips}`
+  const label = weapon === 'portal'
+    ? `${(material || 'glass').toUpperCase()}  ${stock?.[material] ?? 0} m²`
+    : weapon === 'hack'
+      ? `CHIP  ×${chips}`
+      : weapon === 'utility'
+        ? (bombMode === 'roll' ? 'BOMB  ROLL' : 'BOMB  STICK')
         : (RETICLE[weapon] || '');
   const bar = (style) => (
     <span
@@ -593,10 +651,12 @@ export default function MatchLayout() {
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
       renderer.setSize(window.innerWidth, window.innerHeight, false);
       const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x12151c);
+      scene.background = new THREE.Color(0x1b2230);
+      scene.fog = new THREE.Fog(0x1b2230, 24, 68);
       const camera = new THREE.PerspectiveCamera(90, window.innerWidth / Math.max(window.innerHeight, 1), 0.08, 200);
-      scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-      const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+      scene.add(new THREE.AmbientLight(0xb7c3d6, 0.34));
+      scene.add(new THREE.HemisphereLight(0xc9d7ee, 0x3a2c24, 0.42));
+      const sun = new THREE.DirectionalLight(0xfff4e5, 0.62);
       sun.position.set(12, 28, 10);
       scene.add(sun);
 
@@ -658,12 +718,14 @@ export default function MatchLayout() {
         player: {
           x: 0, feetY: 0, z: 0, yaw: 0, pitch: 0,
           vx: 0, vy: 0, vz: 0, onGround: true, jumpLatch: false, hp: 100,
+          crouch: 0, bodyHeight: 1.7,
         },
         inventory: config.pickedLoadout.slice(),
         slotIndex: 0,
         credits: 800,
         mode: 'rifle',
         portalMaterial: 'glass',
+        bombMode: 'stick',
         stock: { glass: 32, wood: 32, iron: 24 },
         hackingChips: 1,
         paint: null,
@@ -677,7 +739,10 @@ export default function MatchLayout() {
         faction: config.faction,
         playerName: config.playerName,
         bannedMaterial: config.bannedMaterial,
-        input: { keys: {}, firing: false, lookX: 0, lookY: 0, releaseAt: {}, ignoreReleaseUntil: 0 },
+        input: {
+          keys: {}, firing: false, lookX: 0, lookY: 0,
+          releaseAt: {}, ignoreReleaseUntil: 0, lastDown: {},
+        },
         audio: null,
         offs: [],
         dead: false,
@@ -705,6 +770,7 @@ export default function MatchLayout() {
             iron: game.stock.iron,
           },
           chips: game.hackingChips,
+          bombMode: game.bombMode || 'stick',
           hold: game.uplinkEndsAt
             ? Math.max(0, Math.ceil((game.uplinkEndsAt - performance.now()) / 1000))
             : null,
@@ -745,6 +811,7 @@ export default function MatchLayout() {
       listen(window, 'keydown', (event) => {
         game.input.keys[event.code] = true;
         game.input.releaseAt[event.code] = 0;
+        game.input.lastDown[event.code] = performance.now();
         if (event.code === 'Space') event.preventDefault();
         if (event.repeat) return;
         if (event.code === 'Digit1') setWeapon('rifle');
@@ -780,6 +847,11 @@ export default function MatchLayout() {
         if (game.mode === 'rifle' && event.button === 0) game.input.firing = true;
         if (game.mode === 'portal' && event.button === 0) beginPaint(game);
         if (game.mode === 'melee' && event.button === 0) swingMelee(game, performance.now());
+        if (game.mode === 'utility' && event.button === 2) {
+          game.bombMode = game.bombMode === 'roll' ? 'stick' : 'roll';
+          pushHud();
+          return;
+        }
         if (game.mode === 'utility' && event.button === 0) useUtility(game);
         if (game.mode === 'hack' && event.button === 0) installChip(game);
       });
@@ -804,6 +876,10 @@ export default function MatchLayout() {
         if (document.pointerLockElement !== canvas) {
           game.input.firing = false;
           cancelPaint(game);
+          game.input.keys.KeyW = false;
+          game.input.keys.KeyA = false;
+          game.input.keys.KeyS = false;
+          game.input.keys.KeyD = false;
         }
       });
       listen(window, 'pointerdown', () => {
@@ -862,6 +938,15 @@ export default function MatchLayout() {
           for (const charge of game.charges) game.scene.remove(charge.mesh);
           game.charges = [];
         }
+        if (game.blasts) {
+          for (const blast of game.blasts) {
+            game.scene.remove(blast.mesh);
+            game.scene.remove(blast.ring);
+            game.scene.remove(blast.light);
+            for (const spark of blast.sparks) game.scene.remove(spark.mesh);
+          }
+          game.blasts = [];
+        }
         rebuildMasks(game);
         game.phase = 'buy';
         game.phaseEndsAt = performance.now() + PHASE_MS.buy;
@@ -911,6 +996,17 @@ export default function MatchLayout() {
 
         updateHighlight(game);
         updatePaint(game);
+        if (game.uplinkDraw) {
+          const active = !!game.uplinkEndsAt && now < game.uplinkEndsAt;
+          const percent = active
+            ? Math.min(100, Math.round((1 - (game.uplinkEndsAt - now) / 30000) * 100))
+            : 0;
+          const key = `${active ? 1 : 0}:${percent}`;
+          if (key !== game.uplinkKey) {
+            game.uplinkKey = key;
+            game.uplinkDraw(percent, active);
+          }
+        }
         updateBombs(game, dt);
         updateTracers(game, dt);
         updateViewmodel(game, dt);
@@ -962,6 +1058,7 @@ export default function MatchLayout() {
           material={loadout.material}
           stock={loadout.stock}
           chips={loadout.chips}
+          bombMode={loadout.bombMode}
           hold={loadout.hold}
         />
       )}

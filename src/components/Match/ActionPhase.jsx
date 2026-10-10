@@ -42,7 +42,7 @@ export function rebuildMasks(game) {
   const addSolid = (mesh, canMove) => {
     if (mesh.userData.solid === false) return;
     if (!mesh.userData.skipBullets) bullets.push(mesh);
-    if (canMove && !mesh.userData.visualOnly) move.push(mesh);
+    if (canMove && !mesh.userData.visualOnly && !mesh.userData.noMove) move.push(mesh);
   };
   for (const mesh of game.floors) {
     consider(mesh);
@@ -65,6 +65,9 @@ export function rebuildMasks(game) {
     if (!bot.active || bot.state === 'dead') continue;
     move.push(bot.body);
     bullets.push(bot.body, bot.head);
+  }
+  for (const cell of game.passages || []) {
+    if (cell.userData.solid !== false) move.push(cell);
   }
 
   game.moveMask = move;
@@ -103,10 +106,71 @@ function killMesh(mesh) {
   mesh.userData.skipBullets = true;
 }
 
-function destroySurface(mesh) {
+function clearHostPassage(game, host) {
+  if (!game.passages || !host.userData.passage) return;
+  const mine = new Set(host.userData.passage);
+  game.passages = game.passages.filter((cell) => !mine.has(cell));
+  host.userData.passage = null;
+}
+
+function rebuildPassage(game, host) {
+  clearHostPassage(game, host);
+  const openings = host.userData.openings || [];
+  if (!openings.length || (host.userData.axis || 'y') === 'y') {
+    host.userData.noMove = false;
+    return;
+  }
+  host.userData.noMove = true;
+  const rect = host.userData.paintRect || panelRect(host);
+  const axis = host.userData.axis || 'z';
+  const anchor = host.position[axis];
+  const thick = Math.max(0.2, panelThickness(host));
+  const step = 0.36;
+  const boxes = [];
+  for (let u = rect.minU; u < rect.maxU - 0.02; u += step) {
+    for (let v = rect.minV; v < rect.maxV - 0.02; v += step) {
+      const cu = Math.min(step, rect.maxU - u);
+      const cv = Math.min(step, rect.maxV - v);
+      const sample = { u: u + cu * 0.5, v: v + cv * 0.5 };
+      const open = openings.some((poly) => pointInPoly(sample, poly));
+      const covered = (host.userData.stamps || []).some((stamp) => (
+        stamp
+        && !stamp.userData.destroyed
+        && stamp.userData.materialName !== 'gone'
+        && stamp.userData.region
+        && pointInPoly(sample, stamp.userData.region.points)
+      ));
+      if (open && !covered) continue;
+      const world = worldFromUV(axis, anchor, sample.u, sample.v);
+      const size = axis === 'x' ? { w: thick, h: cv, d: cu } : { w: cu, h: cv, d: thick };
+      boxes.push({
+        position: world,
+        userData: { ...size, solid: true, kind: 'wall', skipBullets: true, paintable: false, passage: true },
+      });
+    }
+  }
+  host.userData.passage = boxes;
+  if (!game.passages) game.passages = [];
+  game.passages.push(...boxes);
+}
+
+function destroySurface(mesh, game) {
   if (!mesh) return;
   if (mesh.userData.stamp) {
+    const glass = mesh.userData.materialName === 'glass';
+    const poly = mesh.userData.region && mesh.userData.region.points;
+    const hosts = mesh.userData.hosts || (mesh.userData.source ? [mesh.userData.source] : []);
     killMesh(mesh);
+    if (game && glass && poly) {
+      for (const host of hosts) {
+        const rect = host.userData.paintRect || panelRect(host);
+        const clipped = clipToRect(poly, rect);
+        if (clipped.length < 3) continue;
+        if (!host.userData.openings) host.userData.openings = [];
+        host.userData.openings.push(clipped);
+        rebuildPassage(game, host);
+      }
+    }
     return;
   }
   const root = mesh.userData.source || mesh;
@@ -119,7 +183,7 @@ function shatterGlass(game, meshes) {
   let changed = false;
   for (const mesh of meshes) {
     if (!mesh.userData.paintable || mesh.userData.materialName !== 'glass') continue;
-    destroySurface(mesh);
+    destroySurface(mesh, game);
     changed = true;
   }
   if (changed) {
@@ -218,9 +282,9 @@ function panelUV(mesh) {
 }
 
 function portalHex(name) {
-  if (name === 'wood') return 0xc4844a;
-  if (name === 'iron') return 0xd7dee6;
-  return 0x9bfff0;
+  if (name === 'wood') return 0xffe14a;
+  if (name === 'iron') return 0x7ee8ff;
+  return 0xd8fff6;
 }
 
 function uvDist(a, b) {
@@ -283,18 +347,25 @@ function strokeClosed(points) {
 function ensureStroke(game) {
   if (game.stroke) return game.stroke;
   const geo = new game.THREE.BufferGeometry();
-  geo.setAttribute('position', new game.THREE.BufferAttribute(new Float32Array(6), 3));
-  geo.setDrawRange(0, 0);
-  const mat = new game.THREE.LineBasicMaterial({ color: 0x9bfff0 });
-  const line = new game.THREE.Line(geo, mat);
-  line.frustumCulled = false;
-  line.renderOrder = 8;
-  line.visible = false;
+  geo.setAttribute('position', new game.THREE.BufferAttribute(new Float32Array(9), 3));
+  const mat = new game.THREE.MeshBasicMaterial({
+    color: 0xd8fff6,
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+    opacity: 0.96,
+    side: game.THREE.DoubleSide,
+  });
+  const ribbon = new game.THREE.Mesh(geo, mat);
+  ribbon.frustumCulled = false;
+  ribbon.renderOrder = 25;
+  ribbon.raycast = () => {};
+  ribbon.visible = false;
   game.materialDisposables.push(mat);
   game.geometries.push(geo);
-  game.scene.add(line);
-  game.stroke = line;
-  return line;
+  game.scene.add(ribbon);
+  game.stroke = ribbon;
+  return ribbon;
 }
 
 function worldFromUV(axis, anchor, u, v) {
@@ -303,21 +374,108 @@ function worldFromUV(axis, anchor, u, v) {
   return { x: u, y: anchor, z: v };
 }
 
-function redrawStroke(game, color) {
-  const line = ensureStroke(game);
-  const { axis, anchor, points } = game.paint;
-  const count = points.length;
-  const positions = new Float32Array(Math.max(2, count) * 3);
-  for (let i = 0; i < count; i += 1) {
-    const world = worldFromUV(axis, anchor, points[i].u, points[i].v);
-    positions[i * 3] = world.x;
-    positions[i * 3 + 1] = world.y;
-    positions[i * 3 + 2] = world.z;
+function clipSegment(a, b, rect) {
+  let ax = a.u;
+  let ay = a.v;
+  let bx = b.u;
+  let by = b.v;
+  let ca = (ax < rect.minU ? 1 : 0) | (ax > rect.maxU ? 2 : 0) | (ay < rect.minV ? 4 : 0) | (ay > rect.maxV ? 8 : 0);
+  let cb = (bx < rect.minU ? 1 : 0) | (bx > rect.maxU ? 2 : 0) | (by < rect.minV ? 4 : 0) | (by > rect.maxV ? 8 : 0);
+  for (let i = 0; i < 8; i += 1) {
+    if (!(ca | cb)) return [{ u: ax, v: ay }, { u: bx, v: by }];
+    if (ca & cb) return null;
+    const code = ca || cb;
+    let x = 0;
+    let y = 0;
+    if (code & 1) {
+      y = ay + (by - ay) * (rect.minU - ax) / ((bx - ax) || 1e-9);
+      x = rect.minU;
+    } else if (code & 2) {
+      y = ay + (by - ay) * (rect.maxU - ax) / ((bx - ax) || 1e-9);
+      x = rect.maxU;
+    } else if (code & 4) {
+      x = ax + (bx - ax) * (rect.minV - ay) / ((by - ay) || 1e-9);
+      y = rect.minV;
+    } else {
+      x = ax + (bx - ax) * (rect.maxV - ay) / ((by - ay) || 1e-9);
+      y = rect.maxV;
+    }
+    if (code === ca) {
+      ax = x;
+      ay = y;
+      ca = (ax < rect.minU ? 1 : 0) | (ax > rect.maxU ? 2 : 0) | (ay < rect.minV ? 4 : 0) | (ay > rect.maxV ? 8 : 0);
+    } else {
+      bx = x;
+      by = y;
+      cb = (bx < rect.minU ? 1 : 0) | (bx > rect.maxU ? 2 : 0) | (by < rect.minV ? 4 : 0) | (by > rect.maxV ? 8 : 0);
+    }
   }
-  line.geometry.setAttribute('position', new game.THREE.BufferAttribute(positions, 3));
-  line.geometry.setDrawRange(0, count);
-  line.material.color.setHex(color);
-  line.visible = count > 1;
+  return [{ u: ax, v: ay }, { u: bx, v: by }];
+}
+
+function redrawStroke(game, color) {
+  const ribbon = ensureStroke(game);
+  const { axis, plane, anchor, points, materialName } = game.paint;
+  ribbon.material.color.setHex(color);
+  if (!points || points.length < 2) {
+    ribbon.visible = false;
+    return;
+  }
+  const lift = plane == null ? anchor : plane;
+  const rects = [];
+  const seen = new Set();
+  for (const mesh of game.paintMask || []) {
+    const host = mesh.userData.source || mesh;
+    if (seen.has(host) || host.userData.destroyed) continue;
+    if ((host.userData.axis || 'y') !== axis) continue;
+    if (Math.abs(host.position[axis] - anchor) > 0.15) continue;
+    if (materialName && host.userData.materialName !== materialName) continue;
+    seen.add(host);
+    rects.push(host.userData.paintRect || panelRect(host));
+  }
+  const pieces = [];
+  for (let i = 0; i < points.length - 1; i += 1) {
+    let hit = false;
+    for (const rect of rects) {
+      const seg = clipSegment(points[i], points[i + 1], rect);
+      if (!seg) continue;
+      if (Math.hypot(seg[0].u - seg[1].u, seg[0].v - seg[1].v) < 0.02) continue;
+      pieces.push(seg);
+      hit = true;
+    }
+    if (!hit && !rects.length) pieces.push([points[i], points[i + 1]]);
+  }
+  if (!pieces.length) {
+    ribbon.visible = false;
+    return;
+  }
+  const half = 0.045;
+  const positions = new Float32Array(pieces.length * 18);
+  let offset = 0;
+  const push = (u, v) => {
+    const world = worldFromUV(axis, lift, u, v);
+    positions[offset] = world.x;
+    positions[offset + 1] = world.y;
+    positions[offset + 2] = world.z;
+    offset += 3;
+  };
+  for (const [a, b] of pieces) {
+    let du = b.u - a.u;
+    let dv = b.v - a.v;
+    const len = Math.hypot(du, dv) || 1;
+    du /= len;
+    dv /= len;
+    const pu = -dv * half;
+    const pv = du * half;
+    push(a.u + pu, a.v + pv);
+    push(a.u - pu, a.v - pv);
+    push(b.u + pu, b.v + pv);
+    push(a.u - pu, a.v - pv);
+    push(b.u - pu, b.v - pv);
+    push(b.u + pu, b.v + pv);
+  }
+  ribbon.geometry.setAttribute('position', new game.THREE.BufferAttribute(positions, 3));
+  ribbon.visible = true;
 }
 
 function clipToRect(poly, rect) {
@@ -435,33 +593,31 @@ function extrudeWithHoles(game, rect, holes, thickness) {
   return assertExtrude(geo);
 }
 
-function loosenHole(hole, rect) {
-  const margin = 0.025;
-  let touches = false;
-  for (const point of hole) {
-    if (point.u <= rect.minU + margin || point.u >= rect.maxU - margin
-      || point.v <= rect.minV + margin || point.v >= rect.maxV - margin) {
-      touches = true;
-      break;
-    }
-  }
-  if (!touches) return hole.map((point) => ({ u: point.u, v: point.v }));
-  let cu = 0;
-  let cv = 0;
-  for (const point of hole) {
-    cu += point.u;
-    cv += point.v;
-  }
-  cu /= hole.length;
-  cv /= hole.length;
-  const loosened = hole.map((point) => {
-    const du = cu - point.u;
-    const dv = cv - point.v;
-    const len = Math.hypot(du, dv) || 1;
-    return { u: point.u + (du / len) * 0.03, v: point.v + (dv / len) * 0.03 };
+function seatHole(hole, rect) {
+  const eps = 0.04;
+  return hole.map((point) => {
+    let u = point.u;
+    let v = point.v;
+    if (Math.abs(u - rect.minU) <= eps) u = rect.minU;
+    else if (Math.abs(u - rect.maxU) <= eps) u = rect.maxU;
+    if (Math.abs(v - rect.minV) <= eps) v = rect.minV;
+    else if (Math.abs(v - rect.maxV) <= eps) v = rect.maxV;
+    return { u, v };
   });
-  if (Math.abs(shoelace(loosened)) < 0.05) return hole.map((point) => ({ u: point.u, v: point.v }));
-  return loosened;
+}
+
+function insetBoundary(hole, rect) {
+  const eps = 0.05;
+  const nudge = 0.004;
+  return hole.map((point) => {
+    let u = point.u;
+    let v = point.v;
+    if (u <= rect.minU + eps) u = rect.minU + nudge;
+    else if (u >= rect.maxU - eps) u = rect.maxU - nudge;
+    if (v <= rect.minV + eps) v = rect.minV + nudge;
+    else if (v >= rect.maxV - eps) v = rect.maxV - nudge;
+    return { u, v };
+  });
 }
 
 function dedupeRing(points) {
@@ -568,6 +724,7 @@ function attachStamp(game, host, points, materialName, thickness, sign, geo) {
   game.surfaces.push(mesh);
   if (!host.userData.stamps) host.userData.stamps = [];
   host.userData.stamps.push(mesh);
+  return mesh;
 }
 
 export function beginPaint(game) {
@@ -583,9 +740,40 @@ export function beginPaint(game) {
   const plane = anchor + sign * (half + 0.03);
   const point = aimOnPlane(game, axis, plane) || { x: hit.point.x, y: hit.point.y, z: hit.point.z };
   const uv = planeUV(point, axis);
-  game.paint = { axis, anchor, plane, sign, points: [uv] };
+  const materialName = host.userData.materialName;
+  const rect = !!(game.input.keys.ControlLeft || game.input.keys.ControlRight);
+  game.paint = {
+    axis,
+    anchor,
+    plane,
+    sign,
+    rect,
+    origin: uv,
+    materialName,
+    points: [uv],
+  };
   if (game.paintPreview) game.paintPreview.visible = false;
   redrawStroke(game, portalHex(game.portalMaterial));
+}
+
+function rectangleLoop(origin, current) {
+  const corners = [
+    { u: origin.u, v: origin.v },
+    { u: current.u, v: origin.v },
+    { u: current.u, v: current.v },
+    { u: origin.u, v: current.v },
+  ];
+  const points = [];
+  const samples = 8;
+  for (let i = 0; i < 4; i += 1) {
+    const a = corners[i];
+    const b = corners[(i + 1) % 4];
+    for (let s = 0; s < samples; s += 1) {
+      const t = s / samples;
+      points.push({ u: a.u + (b.u - a.u) * t, v: a.v + (b.v - a.v) * t });
+    }
+  }
+  return points;
 }
 
 export function updatePaint(game) {
@@ -597,11 +785,248 @@ export function updatePaint(game) {
   const point = aimOnPlane(game, game.paint.axis, game.paint.plane);
   if (!point) return;
   const uv = planeUV(point, game.paint.axis);
+  if (game.paint.rect) {
+    game.paint.points = rectangleLoop(game.paint.origin, uv);
+    redrawStroke(game, portalHex(game.portalMaterial));
+    return;
+  }
   const last = game.paint.points[game.paint.points.length - 1];
   if (uvDist(last, uv) < 0.05) return;
   game.paint.points.push(uv);
   if (game.paint.points.length > 700) game.paint.points.shift();
   redrawStroke(game, portalHex(game.portalMaterial));
+}
+
+export function pointInPoly(point, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i += 1) {
+    const a = poly[i];
+    const b = poly[j];
+    const hit = (a.v > point.v) !== (b.v > point.v)
+      && point.u < ((b.u - a.u) * (point.v - a.v)) / ((b.v - a.v) || 1e-9) + a.u;
+    if (hit) inside = !inside;
+  }
+  return inside;
+}
+
+function rectsTouch(a, b) {
+  const eps = 0.08;
+  const uOverlap = a.minU < b.maxU - eps && a.maxU > b.minU + eps;
+  const vOverlap = a.minV < b.maxV - eps && a.maxV > b.minV + eps;
+  const uTouch = Math.abs(a.maxU - b.minU) < eps || Math.abs(b.maxU - a.minU) < eps;
+  const vTouch = Math.abs(a.maxV - b.minV) < eps || Math.abs(b.maxV - a.minV) < eps;
+  return (uTouch && vOverlap) || (vTouch && uOverlap);
+}
+
+function groupAdjacent(hosts) {
+  const left = hosts.slice();
+  const groups = [];
+  while (left.length) {
+    const group = [left.pop()];
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (let i = left.length - 1; i >= 0; i -= 1) {
+        const host = left[i];
+        if (host.userData.materialName !== group[0].userData.materialName) continue;
+        const rect = host.userData.paintRect || panelRect(host);
+        const touch = group.some((other) => rectsTouch(rect, other.userData.paintRect || panelRect(other)));
+        if (!touch) continue;
+        group.push(host);
+        left.splice(i, 1);
+        grew = true;
+      }
+    }
+    groups.push(group);
+  }
+  return groups;
+}
+
+function rectsOutline(rects) {
+  const q = (n) => Math.round(n * 500) / 500;
+  const key = (x1, y1, x2, y2) => `${q(x1)},${q(y1)},${q(x2)},${q(y2)}`;
+  const count = new Map();
+  const add = (x1, y1, x2, y2) => {
+    const forward = key(x1, y1, x2, y2);
+    const back = key(x2, y2, x1, y1);
+    if (count.has(back)) {
+      count.set(back, count.get(back) - 1);
+      if (count.get(back) <= 0) count.delete(back);
+    } else count.set(forward, (count.get(forward) || 0) + 1);
+  };
+  for (const rect of rects) {
+    add(rect.minU, rect.minV, rect.maxU, rect.minV);
+    add(rect.maxU, rect.minV, rect.maxU, rect.maxV);
+    add(rect.maxU, rect.maxV, rect.minU, rect.maxV);
+    add(rect.minU, rect.maxV, rect.minU, rect.minV);
+  }
+  const unused = [];
+  for (const [id, n] of count) {
+    if (n <= 0) continue;
+    const [a, b, c, d] = id.split(',').map(Number);
+    unused.push({ a, b, c, d });
+  }
+  const loops = [];
+  while (unused.length) {
+    const first = unused.pop();
+    const loop = [{ u: first.a, v: first.b }];
+    let cu = first.c;
+    let cv = first.d;
+    let guard = 0;
+    while (guard < 800) {
+      loop.push({ u: cu, v: cv });
+      if (Math.abs(cu - first.a) < 0.004 && Math.abs(cv - first.b) < 0.004) break;
+      const idx = unused.findIndex((edge) => Math.abs(edge.a - cu) < 0.004 && Math.abs(edge.b - cv) < 0.004);
+      if (idx < 0) break;
+      const edge = unused.splice(idx, 1)[0];
+      cu = edge.c;
+      cv = edge.d;
+      guard += 1;
+    }
+    if (loop.length >= 4) loops.push(loop);
+  }
+  loops.sort((a, b) => Math.abs(shoelace(b)) - Math.abs(shoelace(a)));
+  const outer = loops[0];
+  if (outer && shoelace(outer) < 0) outer.reverse();
+  return outer || null;
+}
+
+function gridLoops(polys, cell) {
+  let minU = Infinity;
+  let maxU = -Infinity;
+  let minV = Infinity;
+  let maxV = -Infinity;
+  for (const poly of polys) {
+    for (const point of poly) {
+      minU = Math.min(minU, point.u);
+      maxU = Math.max(maxU, point.u);
+      minV = Math.min(minV, point.v);
+      maxV = Math.max(maxV, point.v);
+    }
+  }
+  if (!Number.isFinite(minU)) return [];
+  minU -= cell;
+  minV -= cell;
+  maxU += cell;
+  maxV += cell;
+  const cols = Math.max(1, Math.ceil((maxU - minU) / cell));
+  const rows = Math.max(1, Math.ceil((maxV - minV) / cell));
+  if (cols * rows > 24000) return polys.map((poly) => poly.slice());
+  const grid = [];
+  for (let y = 0; y < rows; y += 1) {
+    const row = [];
+    const v = minV + (y + 0.5) * cell;
+    for (let x = 0; x < cols; x += 1) {
+      const u = minU + (x + 0.5) * cell;
+      row.push(polys.some((poly) => pointInPoly({ u, v }, poly)));
+    }
+    grid.push(row);
+  }
+  const edges = [];
+  const add = (x1, y1, x2, y2) => edges.push([x1, y1, x2, y2]);
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < cols; x += 1) {
+      if (!grid[y][x]) continue;
+      if (y === 0 || !grid[y - 1][x]) add(x + 1, y, x, y);
+      if (y === rows - 1 || !grid[y + 1][x]) add(x, y + 1, x + 1, y + 1);
+      if (x === 0 || !grid[y][x - 1]) add(x, y, x, y + 1);
+      if (x === cols - 1 || !grid[y][x + 1]) add(x + 1, y + 1, x + 1, y);
+    }
+  }
+  const key = (x, y) => `${x},${y}`;
+  const from = new Map();
+  for (const edge of edges) {
+    const id = key(edge[0], edge[1]);
+    if (!from.has(id)) from.set(id, []);
+    from.get(id).push(edge);
+  }
+  const used = new Set();
+  const edgeId = (edge) => `${edge[0]},${edge[1]}>${edge[2]},${edge[3]}`;
+  const loops = [];
+  for (const edge of edges) {
+    if (used.has(edgeId(edge))) continue;
+    const loop = [];
+    let cur = edge;
+    for (let n = 0; n < edges.length + 2; n += 1) {
+      const id = edgeId(cur);
+      if (used.has(id)) break;
+      used.add(id);
+      loop.push({ u: minU + cur[0] * cell, v: minV + cur[1] * cell });
+      const nexts = from.get(key(cur[2], cur[3])) || [];
+      const nxt = nexts.find((item) => !used.has(edgeId(item)));
+      if (!nxt) break;
+      cur = nxt;
+    }
+    const cleaned = [];
+    for (const point of loop) {
+      const last = cleaned[cleaned.length - 1];
+      if (last && Math.hypot(last.u - point.u, last.v - point.v) < cell * 0.4) continue;
+      cleaned.push(point);
+    }
+    if (cleaned.length >= 4) loops.push(cleaned);
+  }
+  return loops.sort((a, b) => Math.abs(shoelace(b)) - Math.abs(shoelace(a)));
+}
+
+function extrudeOutline(game, outer, holes, thickness) {
+  const ring = outer.slice();
+  if (shoelace(ring) < 0) ring.reverse();
+  const shape = new game.THREE.Shape();
+  shape.moveTo(ring[0].u, ring[0].v);
+  for (let i = 1; i < ring.length; i += 1) {
+    const point = ring[i];
+    if (Math.abs(point.u - ring[0].u) < 0.0001 && Math.abs(point.v - ring[0].v) < 0.0001) continue;
+    shape.lineTo(point.u, point.v);
+  }
+  for (const hole of holes) {
+    if (!hole || hole.length < 3) continue;
+    const pts = hole.slice();
+    if (shoelace(pts) > 0) pts.reverse();
+    const path = new game.THREE.Path();
+    path.moveTo(pts[0].u, pts[0].v);
+    for (let i = 1; i < pts.length; i += 1) path.lineTo(pts[i].u, pts[i].v);
+    shape.holes.push(path);
+  }
+  const geo = new game.THREE.ExtrudeGeometry(shape, { depth: thickness, bevelEnabled: false });
+  geo.translate(0, 0, -thickness * 0.5);
+  return assertExtrude(geo);
+}
+
+function flatShape(game, points) {
+  const ring = points.slice();
+  if (shoelace(ring) < 0) ring.reverse();
+  const shape = new game.THREE.Shape();
+  shape.moveTo(ring[0].u, ring[0].v);
+  for (let i = 1; i < ring.length; i += 1) shape.lineTo(ring[i].u, ring[i].v);
+  return new game.THREE.ShapeGeometry(shape);
+}
+
+function dropRemainder(game, host) {
+  const mesh = host.userData.remainder;
+  if (!mesh || mesh.userData.removed) {
+    host.userData.remainder = null;
+    return;
+  }
+  mesh.userData.removed = true;
+  game.scene.remove(mesh);
+  if (mesh.geometry) mesh.geometry.dispose();
+  const index = game.surfaces.indexOf(mesh);
+  if (index >= 0) game.surfaces.splice(index, 1);
+  host.userData.remainder = null;
+}
+
+function retireStamp(game, mesh) {
+  if (!mesh || mesh.userData.retired) return;
+  mesh.userData.retired = true;
+  killMesh(mesh);
+  game.scene.remove(mesh);
+  if (mesh.geometry) mesh.geometry.dispose();
+  const index = game.surfaces.indexOf(mesh);
+  if (index >= 0) game.surfaces.splice(index, 1);
+  for (const host of mesh.userData.hosts || []) {
+    if (!host.userData.stamps) continue;
+    host.userData.stamps = host.userData.stamps.filter((stamp) => stamp !== mesh);
+  }
 }
 
 export function commitPaint(game) {
@@ -628,6 +1053,7 @@ export function commitPaint(game) {
     if (seen.has(host) || host.userData.destroyed) continue;
     if ((host.userData.axis || 'y') !== paint.axis) continue;
     if (Math.abs(host.position[paint.axis] - paint.anchor) > 0.15) continue;
+    if (paint.materialName && host.userData.materialName !== paint.materialName) continue;
     seen.add(host);
     const rect = host.userData.paintRect || panelRect(host);
     const clipped = dedupeRing(clipToRect(points, rect));
@@ -647,43 +1073,125 @@ export function commitPaint(game) {
     failStroke(game);
     return;
   }
-  const prepared = [];
-  try {
-    for (const item of stamped) {
-      const thickness = Math.max(0.08, panelThickness(item.host));
-      const hole = loosenHole(item.clipped, item.rect);
-      const nextHoles = (item.host.userData.holes || []).concat([hole]);
-      const shapeGeo = extrudePolygon(game, item.clipped, thickness);
-      let remainGeo = null;
-      try {
-        remainGeo = extrudeWithHoles(game, item.rect, nextHoles, thickness);
-      } catch (err) {
-        shapeGeo.dispose();
-        throw err;
+  const thickness = Math.max(0.08, panelThickness(stamped[0].host));
+  const stampLoops = gridLoops(stamped.map((item) => item.clipped), 0.03).filter((loop) => Math.abs(shoelace(loop)) > 0.08);
+  if (!stampLoops.length) {
+    failStroke(game);
+    return;
+  }
+  const groups = [];
+  const grouped = new Set();
+  for (const item of stamped) {
+    if (grouped.has(item.host)) continue;
+    const group = [item.host];
+    grouped.add(item.host);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const other of stamped) {
+        if (grouped.has(other.host)) continue;
+        if (other.host.userData.materialName !== group[0].userData.materialName) continue;
+        const rect = other.rect;
+        if (!group.some((host) => rectsTouch(rect, host.userData.paintRect || panelRect(host)))) continue;
+        grouped.add(other.host);
+        group.push(other.host);
+        grew = true;
       }
-      prepared.push({
-        host: item.host,
-        clipped: item.clipped,
-        hole,
-        nextHoles,
-        thickness,
-        shapeGeo,
-        remainGeo,
-      });
     }
+    groups.push(group);
+  }
+  const built = [];
+  let shapes = [];
+  try {
+    for (const group of groups) {
+      const holes = [];
+      for (const host of group) {
+        const item = stamped.find((entry) => entry.host === host);
+        const rect = item ? item.rect : (host.userData.paintRect || panelRect(host));
+        host.userData.paintRect = rect;
+        if (item) holes.push(seatHole(item.clipped, rect));
+        for (const hole of host.userData.holes || []) holes.push(hole);
+      }
+      const outline = rectsOutline(group.map((host) => host.userData.paintRect));
+      const merged = gridLoops(holes, 0.03).filter((loop) => Math.abs(shoelace(loop)) > 0.05);
+      const geo = extrudeOutline(game, outline, merged, thickness);
+      built.push({ group, geo, holes });
+    }
+    let polys = stampLoops.slice();
+    const eaten = [];
+    for (const item of stamped) {
+      for (const stamp of item.host.userData.stamps || []) {
+        if (!stamp || stamp.userData.destroyed || stamp.userData.retired) continue;
+        if (stamp.userData.materialName !== materialName || eaten.includes(stamp)) continue;
+        const region = stamp.userData.region && stamp.userData.region.points;
+        if (!region) continue;
+        if (polys.some((poly) => poly.some((point) => pointInPoly(point, region)) || region.some((point) => pointInPoly(point, poly)))) {
+          polys.push(region);
+          eaten.push(stamp);
+        }
+      }
+    }
+    shapes = eaten.length ? gridLoops(polys, 0.03).filter((loop) => Math.abs(shoelace(loop)) > 0.08) : polys;
+    if (!shapes.length) throw new Error('stamp');
+    for (const stamp of eaten) retireStamp(game, stamp);
   } catch (err) {
-    for (const item of prepared) {
-      item.shapeGeo.dispose();
-      item.remainGeo.dispose();
-    }
+    for (const item of built) item.geo.dispose();
     failStroke(game);
     return;
   }
   game.stock[materialName] = Math.round((have - cost) * 100) / 100;
-  for (const item of prepared) {
-    game.geometries.push(item.shapeGeo, item.remainGeo);
-    attachRemainder(game, item.host, item.nextHoles, item.remainGeo);
-    attachStamp(game, item.host, item.clipped, materialName, item.thickness, paint.sign, item.shapeGeo);
+  for (const item of built) {
+    for (const host of item.group) dropRemainder(game, host);
+    game.geometries.push(item.geo);
+    const mesh = new game.THREE.Mesh(item.geo, item.group[0].material);
+    const axis = item.group[0].userData.axis || 'y';
+    orientToPlane(game, mesh, axis, item.group[0].position[axis]);
+    mesh.frustumCulled = false;
+    mesh.userData = {
+      w: item.group[0].userData.w,
+      h: item.group[0].userData.h,
+      d: item.group[0].userData.d,
+      axis,
+      kind: item.group[0].userData.kind,
+      paintable: true,
+      skinnable: true,
+      materialName: item.group[0].userData.materialName,
+      initialMaterial: item.group[0].userData.initialMaterial,
+      solid: true,
+      transparent: !!item.group[0].userData.transparent,
+      penetrable: !!item.group[0].userData.penetrable,
+      visualOnly: true,
+      structural: true,
+      shape: true,
+      source: item.group[0],
+      center: {
+        x: item.group[0].position.x,
+        y: item.group[0].position.y,
+        z: item.group[0].position.z,
+      },
+    };
+    game.scene.add(mesh);
+    game.surfaces.push(mesh);
+    for (const host of item.group) {
+      const own = stamped.find((entry) => entry.host === host);
+      if (own) {
+        if (!host.userData.holes) host.userData.holes = [];
+        host.userData.holes.push(seatHole(own.clipped, own.rect));
+      }
+      host.userData.remainder = mesh;
+      host.visible = false;
+      host.userData.skipBullets = true;
+    }
+  }
+  for (const loop of shapes) {
+    const geo = flatShape(game, loop);
+    game.geometries.push(geo);
+    const stamp = attachStamp(game, stamped[0].host, loop, materialName, thickness, paint.sign, geo);
+    stamp.userData.hosts = stamped.map((item) => item.host);
+    for (let i = 1; i < stamped.length; i += 1) {
+      if (!stamped[i].host.userData.stamps) stamped[i].host.userData.stamps = [];
+      stamped[i].host.userData.stamps.push(stamp);
+    }
   }
   if (game.stroke) game.stroke.visible = false;
   rebuildMasks(game);
@@ -722,9 +1230,9 @@ export function swingMelee(game, now) {
   for (let i = 0; i < hits.length; i += 1) {
     const data = hits[i].object.userData;
     if (data.solid === false) continue;
-    const canCut = data.paintable && (data.materialName === 'wood' || data.materialName === 'glass');
+    const canCut = data.paintable && data.materialName === 'glass';
     if (canCut) {
-      destroySurface(hits[i].object);
+      destroySurface(hits[i].object, game);
       cut = true;
       continue;
     }
@@ -734,6 +1242,36 @@ export function swingMelee(game, now) {
     rebuildMasks(game);
     game.sfx.hit();
   }
+}
+
+function attachFuse(game, parent) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  const tex = new game.THREE.CanvasTexture(canvas);
+  const mat = new game.THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+  game.materialDisposables.push(mat);
+  const sprite = new game.THREE.Sprite(mat);
+  sprite.position.set(0, 0.32, 0);
+  sprite.scale.set(0.46, 0.46, 1);
+  sprite.raycast = () => {};
+  parent.add(sprite);
+  const draw = (n) => {
+    ctx.clearRect(0, 0, 64, 64);
+    ctx.fillStyle = n <= 2 ? '#ff3b2e' : '#ffd7a1';
+    ctx.beginPath();
+    ctx.arc(32, 32, 28, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#1a100c';
+    ctx.font = 'bold 36px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(n), 32, 34);
+    tex.needsUpdate = true;
+  };
+  draw(5);
+  return draw;
 }
 
 export function useUtility(game) {
@@ -752,6 +1290,7 @@ export function useUtility(game) {
   }
   const mesh = new game.THREE.Mesh(game.chargeGeo, game.mats.charge);
   mesh.raycast = () => {};
+  const draw = attachFuse(game, mesh);
   const x = game._o.x + game._d.x * 0.7;
   const y = game._o.y + game._d.y * 0.7 - 0.15;
   const z = game._o.z + game._d.z * 0.7;
@@ -759,14 +1298,17 @@ export function useUtility(game) {
   game.scene.add(mesh);
   game.charges.push({
     mesh,
-    fuse: 2.2,
+    draw,
+    shown: 5,
+    fuse: 5,
+    mode: game.bombMode === 'roll' ? 'roll' : 'stick',
     flying: true,
     x,
     y,
     z,
-    vx: game._d.x * 14,
-    vy: game._d.y * 14 + 5.5,
-    vz: game._d.z * 14,
+    vx: game._d.x * 11,
+    vy: game._d.y * 11 + 4.2,
+    vz: game._d.z * 11,
   });
   game.sfx.swipe();
 }
@@ -784,56 +1326,199 @@ function chargeHits(game, x, y, z) {
       && box.minY < bounds.maxY && box.maxY > bounds.minY
       && box.minZ < bounds.maxZ && box.maxZ > bounds.minZ) return true;
   }
-  return y < 0.05;
+  return y < 0.12;
+}
+
+function stickCharge(charge, x, y, z) {
+  charge.flying = false;
+  charge.vx = 0;
+  charge.vy = 0;
+  charge.vz = 0;
+  charge.x = x;
+  charge.y = Math.max(0.16, y);
+  charge.z = z;
+  charge.mesh.position.set(charge.x, charge.y, charge.z);
+  charge.mesh.rotation.set(0, charge.mesh.rotation.y, 0);
+}
+
+function clearBlast(game, blast) {
+  game.scene.remove(blast.mesh);
+  game.scene.remove(blast.ring);
+  game.scene.remove(blast.light);
+  for (const spark of blast.sparks) game.scene.remove(spark.mesh);
+  blast.mesh.geometry.dispose();
+  blast.ring.geometry.dispose();
+  blast.mesh.material.dispose();
+  blast.ring.material.dispose();
+}
+
+function updateBlasts(game, dt) {
+  if (!game.blasts || !game.blasts.length) return;
+  for (let i = game.blasts.length - 1; i >= 0; i -= 1) {
+    const blast = game.blasts[i];
+    blast.life -= dt;
+    const t = 1 - Math.max(0, blast.life) / blast.max;
+    const scale = 0.35 + t * 3.5;
+    blast.mesh.scale.setScalar(scale);
+    blast.mesh.material.opacity = 0.85 * (1 - t);
+    blast.ring.scale.setScalar(0.4 + t * 4.2);
+    blast.ring.material.opacity = 0.7 * (1 - t);
+    blast.light.intensity = 6 * (1 - t);
+    for (const spark of blast.sparks) {
+      spark.vx *= 0.96;
+      spark.vy -= 9 * dt;
+      spark.vz *= 0.96;
+      spark.mesh.position.x += spark.vx * dt;
+      spark.mesh.position.y += spark.vy * dt;
+      spark.mesh.position.z += spark.vz * dt;
+    }
+    if (blast.life <= 0) {
+      clearBlast(game, blast);
+      game.blasts.splice(i, 1);
+    }
+  }
+}
+
+function spawnBlast(game, x, y, z) {
+  const THREE = game.THREE;
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xffb15a,
+    transparent: true,
+    opacity: 0.9,
+    depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 18, 12), mat);
+  mesh.position.set(x, y, z);
+  mesh.scale.setScalar(0.3);
+  mesh.raycast = () => {};
+  game.scene.add(mesh);
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0xfff1c9,
+    transparent: true,
+    opacity: 0.75,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.35, 0.7, 28), ringMat);
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.set(x, Math.max(0.08, y - 0.2), z);
+  ring.raycast = () => {};
+  game.scene.add(ring);
+  const light = new THREE.PointLight(0xff8a3a, 6, 16);
+  light.position.set(x, y + 0.4, z);
+  game.scene.add(light);
+  if (!game.sparkGeo) {
+    game.sparkGeo = new THREE.BoxGeometry(0.08, 0.08, 0.08);
+    game.geometries.push(game.sparkGeo);
+  }
+  const sparks = [];
+  for (let i = 0; i < 12; i += 1) {
+    const spark = new THREE.Mesh(game.sparkGeo, mat);
+    spark.position.set(x, y, z);
+    spark.raycast = () => {};
+    game.scene.add(spark);
+    const yaw = Math.random() * Math.PI * 2;
+    const speed = 3 + Math.random() * 6;
+    sparks.push({
+      mesh: spark,
+      vx: Math.cos(yaw) * speed,
+      vy: 2 + Math.random() * 6,
+      vz: Math.sin(yaw) * speed,
+    });
+  }
+  if (!game.blasts) game.blasts = [];
+  game.blasts.push({ mesh, ring, light, sparks, life: 0.48, max: 0.48 });
 }
 
 export function updateBombs(game, dt) {
+  updateBlasts(game, dt);
   if (!game.charges || !game.charges.length) return;
   for (let i = game.charges.length - 1; i >= 0; i -= 1) {
     const charge = game.charges[i];
     charge.fuse -= dt;
     if (charge.flying) {
       charge.vy -= 14 * dt;
-      const nx = charge.x + charge.vx * dt;
-      const ny = charge.y + charge.vy * dt;
-      const nz = charge.z + charge.vz * dt;
-      charge.mesh.position.set(nx, ny, nz);
-      charge.mesh.rotation.x += dt * 9;
-      charge.mesh.rotation.z += dt * 6;
-      if (chargeHits(game, nx, ny, nz) || charge.fuse <= 0) {
-        charge.x = nx;
-        charge.y = ny;
-        charge.z = nz;
-        game.scene.remove(charge.mesh);
-        game.charges.splice(i, 1);
-        detonate(game, charge);
-        continue;
+      let nx = charge.x + charge.vx * dt;
+      let ny = charge.y + charge.vy * dt;
+      let nz = charge.z + charge.vz * dt;
+      if (charge.mode === 'roll') {
+        if (chargeHits(game, nx, charge.y, charge.z)) {
+          charge.vx *= -0.4;
+          nx = charge.x;
+        }
+        if (ny < 0.16 || chargeHits(game, charge.x, ny, charge.z)) {
+          ny = Math.max(0.16, charge.y);
+          charge.vy = charge.vy < -1.4 ? -charge.vy * 0.32 : 0;
+          charge.vx *= 0.9;
+          charge.vz *= 0.9;
+        }
+        if (chargeHits(game, charge.x, charge.y, nz)) {
+          charge.vz *= -0.4;
+          nz = charge.z;
+        }
+        charge.mesh.rotation.z += charge.vx * dt * 3;
+        charge.mesh.rotation.x += charge.vz * dt * 3;
+      } else if (chargeHits(game, nx, ny, nz)) {
+        stickCharge(charge, nx, ny, nz);
+        nx = charge.x;
+        ny = charge.y;
+        nz = charge.z;
+      } else {
+        charge.mesh.rotation.x += dt * 8;
+        charge.mesh.rotation.z += dt * 5;
       }
       charge.x = nx;
       charge.y = ny;
       charge.z = nz;
+      charge.mesh.position.set(nx, ny, nz);
     }
-    charge.mesh.material = Math.sin(charge.fuse * 30) > 0 ? game.mats.charge : game.mats.chargeDim;
-    if (!charge.flying && charge.fuse <= 0) {
+    const shown = Math.max(0, Math.ceil(charge.fuse));
+    if (shown !== charge.shown) {
+      charge.shown = shown;
+      charge.draw?.(shown);
+    }
+    const blink = charge.fuse < 2 ? 22 : 8;
+    charge.mesh.material = Math.sin(charge.fuse * blink) > 0 ? game.mats.charge : game.mats.chargeDim;
+    if (charge.fuse <= 0) {
       game.scene.remove(charge.mesh);
       game.charges.splice(i, 1);
       detonate(game, charge);
     }
   }
 }
+
+function blastReaches(mesh, x, y, z, radius) {
+  const bounds = mesh.userData.stamp ? null : meshBox(mesh);
+  if (!bounds || !Number.isFinite(bounds.minX)) {
+    const center = mesh.userData.center || mesh.position;
+    const dx = center.x - x;
+    const dy = center.y - y;
+    const dz = center.z - z;
+    return dx * dx + dy * dy + dz * dz <= radius * radius;
+  }
+  const cx = Math.max(bounds.minX, Math.min(x, bounds.maxX));
+  const cy = Math.max(bounds.minY, Math.min(y, bounds.maxY));
+  const cz = Math.max(bounds.minZ, Math.min(z, bounds.maxZ));
+  const dx = x - cx;
+  const dy = y - cy;
+  const dz = z - cz;
+  return dx * dx + dy * dy + dz * dz <= radius * radius;
+}
+
 function detonate(game, charge) {
   const radius = 3.6;
+  spawnBlast(game, charge.x, charge.y, charge.z);
   let changed = false;
   for (const mesh of game.paintMask || []) {
-    const center = mesh.userData.center || mesh.position;
-    const dx = center.x - charge.x;
-    const dy = center.y - charge.y;
-    const dz = center.z - charge.z;
-    if (dx * dx + dy * dy + dz * dz > radius * radius) continue;
+    if (!blastReaches(mesh, charge.x, charge.y, charge.z, radius)) continue;
     const name = mesh.userData.materialName;
-    if (name !== 'wood' && name !== 'glass') continue;
-    destroySurface(mesh);
-    changed = true;
+    if (name === 'glass') {
+      destroySurface(mesh, game);
+      changed = true;
+    } else if (name === 'wood' && Math.random() < 0.6) {
+      destroySurface(mesh, game);
+      changed = true;
+    }
   }
   if (changed) rebuildMasks(game);
   game.sfx.blast();
@@ -842,7 +1527,7 @@ function detonate(game, charge) {
   const py = game.player.feetY + 1 - charge.y;
   const pz = game.player.z - charge.z;
   const dist = Math.hypot(px, py, pz);
-  if (dist < 2.8 && dist > 0.05 && game.phase === 'action') {
+  if (dist < radius && dist > 0.05 && game.phase === 'action') {
     damagePlayer(game, 18, 'Bomb');
     game.player.vx += (px / dist) * 8;
     game.player.vz += (pz / dist) * 8;

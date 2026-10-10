@@ -14,7 +14,7 @@
     "react-dom": "^18.3.1",
     "zustand": "^4.5.5"
   },
-  "devDependencies": {d
+  "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
     "vite": "^5.4.0"
   }
