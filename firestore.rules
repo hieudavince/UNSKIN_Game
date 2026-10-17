@@ -1,0 +1,249 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model (Spark plan, no Cloud Functions)
+    // ===============================================================
+    // players/{uid}
+    //   uid, displayName (1-24), tcMmr, credits, stats  -> owner-created, then read-only except name
+    //   pendingMatchId: string|null -> owner, or the host of that match while creating it
+    // matches/{matchId}
+    //   mode PRACTICE|DUEL|DUO|TRIO|SQUAD|FFA, ranked, mapId foundry|complex,
+    //   ffaWinner (FFA only: uid of the top fragger, set by the host), teamSize, playerIds, hostId, teams, names,
+    //   status DRAFTING|IN_PROGRESS|COMPLETED, phase, phaseEndsAtMs, currentRound,
+    //   finalScore {ATLAS, OUTLIERS}, pendingWinner, winner, picks, bannedMaterials
+    //   Created by the host; phase steps only by the host; score moves one point at a time.
+    // matches/{matchId}/rounds/{n}  -> written by the host once per round
+    // ===============================================================
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function nameOk(value) {
+      return value is string && value.size() > 0 && value.size() <= 24;
+    }
+    function materialOk(value) {
+      return value == null || value in ['glass', 'wood', 'iron', 'rubber'];
+    }
+    function matchPath(matchId) {
+      return /databases/$(database)/documents/matches/$(matchId);
+    }
+    function modePlayers(mode) {
+      return mode == 'PRACTICE' ? 1 : mode == 'DUEL' ? 2 : mode == 'DUO' ? 4 : mode == 'TRIO' ? 6 : mode == 'SQUAD' ? 10 : mode == 'FFA' ? 8 : -1;
+    }
+    function isMember() {
+      return signedIn() && request.auth.uid in resource.data.playerIds;
+    }
+    function sameRoster() {
+      return request.resource.data.playerIds == resource.data.playerIds
+        && request.resource.data.hostId == resource.data.hostId
+        && request.resource.data.mode == resource.data.mode
+        && request.resource.data.teams == resource.data.teams;
+    }
+    function scoreStep() {
+      return request.resource.data.finalScore.ATLAS >= resource.data.finalScore.ATLAS
+        && request.resource.data.finalScore.OUTLIERS >= resource.data.finalScore.OUTLIERS
+        && request.resource.data.finalScore.ATLAS - resource.data.finalScore.ATLAS
+          + request.resource.data.finalScore.OUTLIERS - resource.data.finalScore.OUTLIERS <= 1;
+    }
+    // ffaWinner may only be written by the host when an FFA action phase ends,
+    // and only to a player in the match.
+    function ffaStep() {
+      let before = resource.data.get('ffaWinner', null);
+      let after = request.resource.data.get('ffaWinner', null);
+      return after == before
+        || (resource.data.mode == 'FFA'
+          && resource.data.phase == 'ACTION'
+          && request.resource.data.phase == 'POST_ROUND'
+          && (after == null || after in resource.data.playerIds));
+    }
+    function draftPick() {
+      return isMember()
+        && resource.data.status == 'DRAFTING'
+        && sameRoster()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['picks'])
+        && request.resource.data.picks.diff(resource.data.picks).affectedKeys().hasOnly([request.auth.uid]);
+    }
+    function draftLock() {
+      return isMember()
+        && resource.data.status == 'DRAFTING'
+        && request.resource.data.status == 'IN_PROGRESS'
+        && request.resource.data.phase == 'BUY'
+        && request.resource.data.picks.keys().hasAll(resource.data.playerIds)
+        && sameRoster()
+        && request.resource.data.finalScore == resource.data.finalScore
+        && materialOk(request.resource.data.bannedMaterials.ATLAS)
+        && materialOk(request.resource.data.bannedMaterials.OUTLIERS);
+    }
+    function hostTimedStep() {
+      return request.auth.uid == resource.data.hostId
+        && resource.data.status == 'IN_PROGRESS'
+        && sameRoster()
+        && scoreStep()
+        && ffaStep()
+        && request.time.toMillis() + 3000 >= resource.data.phaseEndsAtMs
+        && (
+          (resource.data.phase == 'BUY' && request.resource.data.phase == 'PREP' && request.resource.data.currentRound == resource.data.currentRound)
+          || (resource.data.phase == 'PREP' && request.resource.data.phase == 'ACTION' && request.resource.data.currentRound == resource.data.currentRound)
+          || (resource.data.phase == 'ACTION' && request.resource.data.phase == 'POST_ROUND' && request.resource.data.currentRound == resource.data.currentRound)
+          || (resource.data.phase == 'POST_ROUND' && request.resource.data.phase == 'BUY' && resource.data.pendingWinner == null && request.resource.data.currentRound == resource.data.currentRound + 1)
+          || (resource.data.phase == 'POST_ROUND' && request.resource.data.status == 'COMPLETED' && resource.data.pendingWinner != null && request.resource.data.winner == resource.data.pendingWinner)
+        );
+    }
+    function hostRoundEnd() {
+      return request.auth.uid == resource.data.hostId
+        && resource.data.status == 'IN_PROGRESS'
+        && resource.data.phase == 'ACTION'
+        && request.resource.data.phase == 'POST_ROUND'
+        && sameRoster()
+        && scoreStep()
+        && ffaStep()
+        && request.resource.data.currentRound == resource.data.currentRound;
+    }
+    function leaveComplete() {
+      return isMember()
+        && resource.data.status != 'COMPLETED'
+        && request.resource.data.status == 'COMPLETED'
+        && request.resource.data.phase == null
+        && sameRoster()
+        && request.resource.data.finalScore == resource.data.finalScore
+        && request.resource.data.get('ffaWinner', null) == resource.data.get('ffaWinner', null)
+        && (resource.data.playerIds.size() == 1 || request.auth.uid == resource.data.hostId);
+    }
+    function validNewMatch() {
+      let m = request.resource.data;
+      let size = modePlayers(m.mode);
+      let practice = m.mode == 'PRACTICE';
+      let ffa = m.mode == 'FFA';
+      let count = m.playerIds.size();
+      return m.hostId == request.auth.uid
+        && request.auth.uid in m.playerIds
+        && size > 0
+        && (ffa ? (count >= 2 && count <= size) : count == size)
+        && m.teams.ATLAS.playerIds.size() == (practice ? 1 : ffa ? count : size / 2)
+        && m.teams.OUTLIERS.playerIds.size() == (practice || ffa ? 0 : size / 2)
+        && m.mapId == (ffa ? 'complex' : 'foundry')
+        && (!ffa || m.ranked == false)
+        && m.finalScore.ATLAS == 0
+        && m.finalScore.OUTLIERS == 0
+        && m.currentRound == 1
+        && m.winner == null
+        && m.pendingWinner == null
+        && m.picks == {}
+        && (
+          (m.ranked == false && m.status == 'IN_PROGRESS' && m.phase == 'BUY')
+          || (m.ranked == true && !practice && m.status == 'DRAFTING' && m.phase == null)
+        );
+    }
+
+    function numAt(data, key, fallback) {
+      return data.keys().hasAll([key]) ? data[key] : fallback;
+    }
+    function rewardStep(userId) {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
+      let stats = request.resource.data.stats;
+      return request.auth.uid == userId
+        && diff.hasOnly(['points', 'xp', 'level', 'stats'])
+        && request.resource.data.points is int
+        && request.resource.data.xp is int
+        && request.resource.data.level is int
+        && request.resource.data.points >= numAt(resource.data, 'points', 0)
+        && request.resource.data.points <= numAt(resource.data, 'points', 0) + 200
+        && request.resource.data.xp >= numAt(resource.data, 'xp', 0)
+        && request.resource.data.xp <= numAt(resource.data, 'xp', 0) + 250
+        && request.resource.data.level >= numAt(resource.data, 'level', 1)
+        && request.resource.data.level <= numAt(resource.data, 'level', 1) + 1
+        && stats.matchesPlayed == resource.data.stats.matchesPlayed + 1
+        && stats.wins >= resource.data.stats.wins
+        && stats.wins <= resource.data.stats.wins + 1
+        && stats.losses >= resource.data.stats.losses
+        && stats.losses <= resource.data.stats.losses + 1
+        && stats.kills == resource.data.stats.kills
+        && stats.deaths == resource.data.stats.deaths
+        && stats.skinSynergyAssists == resource.data.stats.skinSynergyAssists;
+    }
+    function cosmeticStep(userId) {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
+      return request.auth.uid == userId
+        && request.resource.data.points is int
+        && request.resource.data.points >= 0
+        && request.resource.data.points <= numAt(resource.data, 'points', 0)
+        && (
+          diff.hasOnly(['gunSkin']) && request.resource.data.gunSkin in ['stock', 'night', 'brass', 'mint']
+          || diff.hasOnly(['playerSkin']) && request.resource.data.playerSkin in ['default', 'atlas', 'outlier', 'night']
+          || diff.hasOnly(['points', 'ownedGuns', 'gunSkin'])
+            && request.resource.data.gunSkin in ['stock', 'night', 'brass', 'mint']
+            && request.resource.data.ownedGuns is list
+            && request.resource.data.ownedGuns.size() <= 8
+          || diff.hasOnly(['points', 'ownedSuits', 'playerSkin'])
+            && request.resource.data.playerSkin in ['default', 'atlas', 'outlier', 'night']
+            && request.resource.data.ownedSuits is list
+            && request.resource.data.ownedSuits.size() <= 8
+        );
+    }
+
+    match /players/{userId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.uid == userId
+        && nameOk(request.resource.data.displayName)
+        && request.resource.data.tcMmr == 1000
+        && request.resource.data.credits == 800
+        && request.resource.data.pendingMatchId == null
+        && request.resource.data.points == 0
+        && request.resource.data.xp == 0
+        && request.resource.data.level == 1
+        && request.resource.data.gunSkin == 'stock'
+        && request.resource.data.playerSkin == 'default'
+        && request.resource.data.stats.matchesPlayed == 0
+        && request.resource.data.keys().hasOnly([
+          'uid', 'displayName', 'tcMmr', 'credits', 'pendingMatchId', 'stats', 'createdAt',
+          'points', 'xp', 'level', 'gunSkin', 'playerSkin', 'ownedGuns', 'ownedSuits'
+        ]);
+      allow update: if signedIn() && (
+        (
+          request.auth.uid == userId
+          && nameOk(request.resource.data.displayName)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'pendingMatchId'])
+          && (
+            request.resource.data.pendingMatchId == null
+            || (request.resource.data.pendingMatchId is string
+              && userId in getAfter(matchPath(request.resource.data.pendingMatchId)).data.playerIds)
+          )
+        )
+        || (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pendingMatchId'])
+          && resource.data.pendingMatchId == null
+          && request.resource.data.pendingMatchId is string
+          && getAfter(matchPath(request.resource.data.pendingMatchId)).data.hostId == request.auth.uid
+          && userId in getAfter(matchPath(request.resource.data.pendingMatchId)).data.playerIds
+        )
+        || rewardStep(userId)
+        || cosmeticStep(userId)
+      );
+      allow delete: if false;
+    }
+
+    match /matches/{matchId} {
+      allow read: if signedIn() && (resource == null || request.auth.uid in resource.data.playerIds);
+      allow create: if signedIn() && validNewMatch();
+      allow update: if draftPick() || draftLock() || hostTimedStep() || hostRoundEnd() || leaveComplete();
+      allow delete: if false;
+
+      match /rounds/{roundId} {
+        allow read: if signedIn() && request.auth.uid in get(matchPath(matchId)).data.playerIds;
+        allow create: if signedIn()
+          && get(matchPath(matchId)).data.hostId == request.auth.uid
+          && request.resource.data.winner in ['ATLAS', 'OUTLIERS']
+          && request.resource.data.reason is string
+          && request.resource.data.reason.size() <= 80;
+        allow update, delete: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
